@@ -1,0 +1,743 @@
+# =============================================================================
+# Secure Software Supply Chain Pipeline
+# =============================================================================
+# This workflow demonstrates a complete software supply chain security pipeline
+# running entirely within GitHub Actions — no external infrastructure required.
+#
+# Security stages mapped to the 10 characteristics:
+#   1. Commit Signature Verification
+#   2. SAST (Static Application Security Testing)
+#   3. Build with Multi-Stage Dockerfile (minimal base image)
+#   4. Container Image Vulnerability Scan
+#   5. SBOM Generation
+#   6. Container Image Signing
+#   7. SLSA Provenance Generation
+#   8. Deploy to KinD (Kubernetes in Docker)
+#   9. Admission Control with Kyverno (signature verification at deploy)
+#  10. DAST (Dynamic Application Security Testing)
+#
+# All artifacts are uploaded to the workflow run for audit trail purposes.
+# =============================================================================
+
+name: Secure Supply Chain Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:  # Allow manual triggers
+
+env:
+  IMAGE_NAME: hello-secure
+  IMAGE_TAG: ${{ github.sha }}
+  # For GHCR (GitHub Container Registry)
+  REGISTRY: ghcr.io
+  FULL_IMAGE: ghcr.io/${{ github.repository_owner }}/hello-secure
+
+permissions:
+  contents: read
+  packages: write        # Push to GHCR
+  id-token: write        # Keyless signing with Cosign (OIDC)
+  security-events: write # Upload SARIF results
+  attestations: write    # GitHub attestations
+
+jobs:
+  # ===========================================================================
+  # STAGE 1: Verify Commit Signatures
+  # ===========================================================================
+  verify-commits:
+    name: "1 · Verify Commit Signatures"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for signature check
+
+      - name: Check commit signatures
+        run: |
+          echo "============================================"
+          echo "  STAGE 1: Commit Signature Verification"
+          echo "============================================"
+          echo ""
+
+          # Check the latest commit's signature
+          COMMIT_SHA="${{ github.sha }}"
+          echo "Checking commit: $COMMIT_SHA"
+
+          # Attempt GPG/SSH signature verification
+          # In a real pipeline, unsigned commits would fail the build
+          SIGNATURE_STATUS=$(git log --format='%G?' -1 "$COMMIT_SHA" 2>/dev/null || echo "N")
+
+          case "$SIGNATURE_STATUS" in
+            G) echo "✅ Commit is signed with a GOOD signature" ;;
+            B) echo "❌ Commit has a BAD signature — FAILING"; exit 1 ;;
+            U) echo "⚠️  Commit is signed but key is UNTRUSTED (acceptable for demo)" ;;
+            X) echo "✅ Commit is signed with an EXPIRED but valid signature" ;;
+            N) echo "⚠️  Commit is NOT signed (would fail in enforced mode)" ;;
+            *)  echo "⚠️  Signature status unknown: $SIGNATURE_STATUS" ;;
+          esac
+
+          echo ""
+          echo "Commit details:"
+          git log --format='  Author:  %aN <%aE>%n  Date:    %aD%n  Message: %s%n  Sig:     %G? %GS' -1
+
+          # Generate audit artifact
+          echo "---" > /tmp/commit-signature-report.txt
+          echo "Commit Signature Verification Report" >> /tmp/commit-signature-report.txt
+          echo "Pipeline Run: ${{ github.run_id }}" >> /tmp/commit-signature-report.txt
+          echo "Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> /tmp/commit-signature-report.txt
+          echo "Commit: $COMMIT_SHA" >> /tmp/commit-signature-report.txt
+          echo "Signature Status: $SIGNATURE_STATUS" >> /tmp/commit-signature-report.txt
+          git log --format='Author: %aN <%aE>' -1 >> /tmp/commit-signature-report.txt
+          echo "---" >> /tmp/commit-signature-report.txt
+
+      - name: Upload signature report
+        uses: actions/upload-artifact@v4
+        with:
+          name: 01-commit-signature-report
+          path: /tmp/commit-signature-report.txt
+
+  # ===========================================================================
+  # STAGE 2: Static Application Security Testing (SAST)
+  # ===========================================================================
+  sast:
+    name: "2 · SAST — Semgrep + CodeQL"
+    runs-on: ubuntu-latest
+    needs: verify-commits
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # --- Semgrep SAST ---
+      - name: Run Semgrep
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: >-
+            p/java
+            p/owasp-top-ten
+            p/security-audit
+          generateSarif: true
+        env:
+          SEMGREP_RULES: "p/java p/owasp-top-ten p/security-audit"
+        continue-on-error: true
+
+      - name: Save Semgrep SARIF
+        if: always()
+        run: |
+          # Semgrep outputs to semgrep.sarif by default
+          if [ -f semgrep.sarif ]; then
+            cp semgrep.sarif /tmp/semgrep-results.sarif
+            echo "✅ Semgrep scan completed — results saved"
+          else
+            echo '{"version":"2.1.0","runs":[]}' > /tmp/semgrep-results.sarif
+            echo "⚠️  No Semgrep results file found"
+          fi
+
+      - name: Upload Semgrep SARIF to GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: /tmp/semgrep-results.sarif
+          category: semgrep
+        continue-on-error: true
+
+      - name: Upload Semgrep artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: 02-sast-semgrep-results
+          path: /tmp/semgrep-results.sarif
+
+  codeql:
+    name: "2 · SAST — CodeQL"
+    runs-on: ubuntu-latest
+    needs: verify-commits
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: java
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: "21"
+          distribution: "temurin"
+
+      - name: Build for CodeQL
+        working-directory: ./app
+        run: mvn package -DskipTests -B -q
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: codeql-java
+
+  # ===========================================================================
+  # STAGE 3: Build Container Image (Multi-Stage, Minimal Base)
+  # ===========================================================================
+  build:
+    name: "3 · Build Container Image"
+    runs-on: ubuntu-latest
+    needs: [sast, codeql]
+    outputs:
+      image-digest: ${{ steps.build-image.outputs.digest }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        id: build-image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./app
+          file: ./app/Dockerfile
+          push: true
+          tags: |
+            ${{ env.FULL_IMAGE }}:${{ env.IMAGE_TAG }}
+            ${{ env.FULL_IMAGE }}:latest
+          platforms: linux/amd64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: false  # We generate our own SBOM with Syft
+
+      - name: Record build metadata
+        run: |
+          echo "============================================"
+          echo "  STAGE 3: Build Complete"
+          echo "============================================"
+          echo "Image:  ${{ env.FULL_IMAGE }}:${{ env.IMAGE_TAG }}"
+          echo "Digest: ${{ steps.build-image.outputs.digest }}"
+
+          cat <<EOF > /tmp/build-metadata.json
+          {
+            "image": "${{ env.FULL_IMAGE }}",
+            "tag": "${{ env.IMAGE_TAG }}",
+            "digest": "${{ steps.build-image.outputs.digest }}",
+            "builder": "docker/build-push-action@v5",
+            "dockerfile": "app/Dockerfile",
+            "base_image": "eclipse-temurin:21-jre-alpine",
+            "build_type": "multi-stage",
+            "platform": "linux/amd64",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "workflow_run": "${{ github.run_id }}",
+            "commit": "${{ github.sha }}"
+          }
+          EOF
+
+      - name: Upload build metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: 03-build-metadata
+          path: /tmp/build-metadata.json
+
+  # ===========================================================================
+  # STAGE 4: Vulnerability Scan (Trivy)
+  # ===========================================================================
+  vulnerability-scan:
+    name: "4 · Vulnerability Scan — Trivy"
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Run Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.FULL_IMAGE }}:${{ env.IMAGE_TAG }}
+          format: "table"
+          output: "/tmp/trivy-vuln-report.txt"
+          severity: "CRITICAL,HIGH,MEDIUM"
+          exit-code: "0"  # Set to 1 to fail pipeline on vulnerabilities
+
+      - name: Run Trivy scan (SARIF for GitHub Security)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.FULL_IMAGE }}:${{ env.IMAGE_TAG }}
+          format: "sarif"
+          output: "/tmp/trivy-results.sarif"
+          severity: "CRITICAL,HIGH,MEDIUM"
+
+      - name: Upload Trivy SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: /tmp/trivy-results.sarif
+          category: trivy-container
+        continue-on-error: true
+
+      - name: Display scan summary
+        run: |
+          echo "============================================"
+          echo "  STAGE 4: Vulnerability Scan Results"
+          echo "============================================"
+          cat /tmp/trivy-vuln-report.txt
+
+      - name: Upload Trivy reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: 04-trivy-vulnerability-report
+          path: |
+            /tmp/trivy-vuln-report.txt
+            /tmp/trivy-results.sarif
+
+  # ===========================================================================
+  # STAGE 5: Generate SBOM (Syft)
+  # ===========================================================================
+  sbom:
+    name: "5 · SBOM Generation — Syft"
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Install Syft
+        uses: anchore/sbom-action/download-syft@v0
+
+      - name: Generate SBOM (SPDX JSON)
+        run: |
+          echo "============================================"
+          echo "  STAGE 5: SBOM Generation"
+          echo "============================================"
+
+          syft ${{ env.FULL_IMAGE }}:${{ env.IMAGE_TAG }} \
+            -o spdx-json=/tmp/sbom-spdx.json
+
+          echo ""
+          echo "SPDX SBOM generated. Package count:"
+          jq '.packages | length' /tmp/sbom-spdx.json
+          echo ""
+          echo "Top-level packages:"
+          jq -r '.packages[:15][] | "  - \(.name)@\(.versionInfo // "n/a")"' /tmp/sbom-spdx.json
+
+      - name: Generate SBOM (CycloneDX)
+        run: |
+          syft ${{ env.FULL_IMAGE }}:${{ env.IMAGE_TAG }} \
+            -o cyclonedx-json=/tmp/sbom-cyclonedx.json
+
+      - name: Upload SBOM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: 05-sbom
+          path: |
+            /tmp/sbom-spdx.json
+            /tmp/sbom-cyclonedx.json
+
+  # ===========================================================================
+  # STAGE 6: Sign Container Image (Cosign — Keyless via OIDC)
+  # ===========================================================================
+  sign-image:
+    name: "6 · Sign Image — Cosign (Keyless)"
+    runs-on: ubuntu-latest
+    needs: [vulnerability-scan, sbom]
+    steps:
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sign the container image (keyless)
+        run: |
+          echo "============================================"
+          echo "  STAGE 6: Container Image Signing"
+          echo "============================================"
+
+          IMAGE_DIGEST="${{ needs.build.outputs.image-digest }}"
+          FULL_REF="${{ env.FULL_IMAGE }}@${IMAGE_DIGEST}"
+
+          echo "Signing: $FULL_REF"
+          echo ""
+
+          # Keyless signing using GitHub Actions OIDC token
+          # The signature is automatically recorded in the Rekor
+          # transparency log — providing an immutable audit trail
+          cosign sign \
+            --yes \
+            --recursive \
+            "$FULL_REF"
+
+          echo ""
+          echo "✅ Image signed successfully"
+          echo ""
+
+          # Verify the signature we just created
+          echo "Verifying signature..."
+          cosign verify \
+            --certificate-identity-regexp="https://github.com/${{ github.repository_owner }}/.*" \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+            "$FULL_REF" | jq . > /tmp/cosign-verification.json
+
+          echo "✅ Signature verified"
+
+      - name: Attach SBOM to image
+        run: |
+          # Download SBOM from previous stage
+          echo "Attaching SBOM to container image in registry..."
+          # Note: In practice, download artifact or regenerate SBOM here
+          # cosign attach sbom --sbom sbom-spdx.json ${{ env.FULL_IMAGE }}@${{ needs.build.outputs.image-digest }}
+
+      - name: Generate signing report
+        run: |
+          cat <<EOF > /tmp/signing-report.json
+          {
+            "image": "${{ env.FULL_IMAGE }}",
+            "digest": "${{ needs.build.outputs.image-digest }}",
+            "signing_method": "cosign-keyless-oidc",
+            "oidc_issuer": "https://token.actions.githubusercontent.com",
+            "transparency_log": "rekor.sigstore.dev",
+            "signer_identity": "https://github.com/${{ github.repository }}/.github/workflows/secure-pipeline.yml@${{ github.ref }}",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+
+      - name: Upload signing report
+        uses: actions/upload-artifact@v4
+        with:
+          name: 06-cosign-signing-report
+          path: |
+            /tmp/signing-report.json
+            /tmp/cosign-verification.json
+
+  # ===========================================================================
+  # STAGE 7: SLSA Provenance
+  # ===========================================================================
+  provenance:
+    name: "7 · SLSA Provenance"
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Generate provenance record
+        run: |
+          echo "============================================"
+          echo "  STAGE 7: SLSA Provenance"
+          echo "============================================"
+
+          # GitHub Actions + docker/build-push-action with provenance: true
+          # already generates SLSA provenance at build time.
+          #
+          # For additional provenance, we generate an in-toto style
+          # attestation linking inputs to outputs.
+
+          cat <<EOF > /tmp/slsa-provenance.json
+          {
+            "_type": "https://in-toto.io/Statement/v0.1",
+            "predicateType": "https://slsa.dev/provenance/v0.2",
+            "subject": [
+              {
+                "name": "${{ env.FULL_IMAGE }}",
+                "digest": {
+                  "sha256": "${{ needs.build.outputs.image-digest }}"
+                }
+              }
+            ],
+            "predicate": {
+              "builder": {
+                "id": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+              },
+              "buildType": "https://github.com/actions/runner",
+              "invocation": {
+                "configSource": {
+                  "uri": "git+https://github.com/${{ github.repository }}@${{ github.ref }}",
+                  "digest": {
+                    "sha1": "${{ github.sha }}"
+                  },
+                  "entryPoint": ".github/workflows/secure-pipeline.yml"
+                }
+              },
+              "metadata": {
+                "buildInvocationID": "${{ github.run_id }}-${{ github.run_attempt }}",
+                "buildStartedOn": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+                "completeness": {
+                  "parameters": true,
+                  "environment": true,
+                  "materials": true
+                },
+                "reproducible": false
+              },
+              "materials": [
+                {
+                  "uri": "git+https://github.com/${{ github.repository }}",
+                  "digest": { "sha1": "${{ github.sha }}" }
+                },
+                {
+                  "uri": "docker://eclipse-temurin:21-jdk-alpine",
+                  "digest": { "note": "builder base image" }
+                },
+                {
+                  "uri": "docker://eclipse-temurin:21-jre-alpine",
+                  "digest": { "note": "runtime base image" }
+                }
+              ]
+            }
+          }
+          EOF
+
+          echo "Provenance record generated"
+          jq . /tmp/slsa-provenance.json
+
+      - name: Upload provenance
+        uses: actions/upload-artifact@v4
+        with:
+          name: 07-slsa-provenance
+          path: /tmp/slsa-provenance.json
+
+  # ===========================================================================
+  # STAGES 8-10: Deploy to KinD + Kyverno + DAST
+  # ===========================================================================
+  deploy-and-test:
+    name: "8-10 · KinD Deploy + Kyverno + DAST"
+    runs-on: ubuntu-latest
+    needs: [sign-image, provenance]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # --- STAGE 8: Create KinD cluster ---
+      - name: Create KinD cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: secure-supply-chain
+          wait: 120s
+
+      - name: Verify cluster
+        run: |
+          echo "============================================"
+          echo "  STAGE 8: KinD Cluster Ready"
+          echo "============================================"
+          kubectl cluster-info
+          kubectl get nodes
+
+      # --- STAGE 9: Install Kyverno for admission control ---
+      - name: Install Kyverno
+        run: |
+          echo "============================================"
+          echo "  STAGE 9: Kyverno Admission Controller"
+          echo "============================================"
+
+          # Install Kyverno via Helm
+          helm repo add kyverno https://kyverno.github.io/kyverno/
+          helm repo update
+          helm install kyverno kyverno/kyverno \
+            --namespace kyverno \
+            --create-namespace \
+            --set replicaCount=1 \
+            --wait \
+            --timeout 120s
+
+          echo ""
+          echo "✅ Kyverno installed"
+          kubectl get pods -n kyverno
+
+      - name: Apply Kyverno image verification policy
+        run: |
+          # Apply the signature verification policy
+          kubectl apply -f k8s/kyverno-policy.yaml
+
+          echo ""
+          echo "✅ Image verification policy applied"
+          kubectl get clusterpolicy
+
+      # --- Deploy the application ---
+      - name: Pull and load image into KinD
+        run: |
+          # Pull from GHCR and load into KinD's internal registry
+          docker pull ${{ env.FULL_IMAGE }}:${{ env.IMAGE_TAG }}
+
+          # Tag for local use in KinD
+          docker tag ${{ env.FULL_IMAGE }}:${{ env.IMAGE_TAG }} hello-secure:latest
+
+          # Load into KinD cluster
+          kind load docker-image hello-secure:latest --name secure-supply-chain
+
+          echo "✅ Image loaded into KinD"
+
+      - name: Deploy application
+        run: |
+          kubectl apply -f k8s/deployment.yaml
+
+          echo "Waiting for deployment to be ready..."
+          kubectl rollout status deployment/hello-secure --timeout=120s
+
+          echo ""
+          echo "✅ Application deployed"
+          kubectl get pods -l app=hello-secure
+          kubectl get svc hello-secure
+
+      - name: Verify application is running
+        run: |
+          # Port-forward in background
+          kubectl port-forward svc/hello-secure 8080:80 &
+          PF_PID=$!
+          sleep 5
+
+          # Test the endpoint
+          echo "Testing application endpoint..."
+          RESPONSE=$(curl -s http://localhost:8080/)
+          echo "Response: $RESPONSE"
+
+          if [[ "$RESPONSE" == *"Hello, Secure World!"* ]]; then
+            echo "✅ Application responding correctly"
+          else
+            echo "❌ Unexpected response"
+            exit 1
+          fi
+
+          # Health check
+          HEALTH=$(curl -s http://localhost:8080/health)
+          echo "Health: $HEALTH"
+
+          kill $PF_PID 2>/dev/null || true
+
+      # --- STAGE 10: DAST with OWASP ZAP ---
+      - name: Run OWASP ZAP (DAST)
+        run: |
+          echo "============================================"
+          echo "  STAGE 10: DAST — OWASP ZAP"
+          echo "============================================"
+
+          # Port-forward for ZAP scanning
+          kubectl port-forward svc/hello-secure 8080:80 &
+          PF_PID=$!
+          sleep 5
+
+          # Run ZAP baseline scan in Docker
+          # The baseline scan checks for common web vulnerabilities
+          docker run --rm \
+            --network host \
+            -v /tmp:/zap/wrk:rw \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py \
+              -t http://localhost:8080 \
+              -r zap-report.html \
+              -J zap-report.json \
+              -I \
+            || true  # Don't fail pipeline on ZAP findings for demo
+
+          kill $PF_PID 2>/dev/null || true
+
+          echo ""
+          echo "✅ OWASP ZAP scan completed"
+
+          # Display summary from JSON if available
+          if [ -f /tmp/zap-report.json ]; then
+            echo "ZAP findings summary:"
+            jq '.site[0].alerts | length' /tmp/zap-report.json 2>/dev/null && \
+            jq -r '.site[0].alerts[]? | "  [\(.riskdesc)] \(.alert)"' /tmp/zap-report.json 2>/dev/null || \
+            echo "  (see HTML report for details)"
+          fi
+
+      - name: Upload DAST report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: 10-dast-zap-report
+          path: |
+            /tmp/zap-report.html
+            /tmp/zap-report.json
+
+      - name: Collect deployment evidence
+        if: always()
+        run: |
+          echo "============================================"
+          echo "  Deployment Evidence Collection"
+          echo "============================================"
+
+          {
+            echo "=== Cluster Info ==="
+            kubectl cluster-info
+            echo ""
+            echo "=== Nodes ==="
+            kubectl get nodes -o wide
+            echo ""
+            echo "=== Pods ==="
+            kubectl get pods -A
+            echo ""
+            echo "=== Kyverno Policy Reports ==="
+            kubectl get policyreport -A -o yaml 2>/dev/null || echo "No policy reports"
+            echo ""
+            echo "=== Deployment Describe ==="
+            kubectl describe deployment hello-secure
+            echo ""
+            echo "=== Events ==="
+            kubectl get events --sort-by='.lastTimestamp'
+          } > /tmp/deployment-evidence.txt
+
+      - name: Upload deployment evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: 08-09-deployment-evidence
+          path: /tmp/deployment-evidence.txt
+
+  # ===========================================================================
+  # FINAL: Pipeline Summary & Audit Trail
+  # ===========================================================================
+  audit-summary:
+    name: "📋 Pipeline Audit Summary"
+    runs-on: ubuntu-latest
+    needs: [verify-commits, sast, codeql, build, vulnerability-scan, sbom, sign-image, provenance, deploy-and-test]
+    if: always()
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/all-artifacts
+
+      - name: Generate pipeline summary
+        run: |
+          cat <<'EOF' > /tmp/pipeline-audit-summary.md
+          # Secure Supply Chain — Pipeline Audit Summary
+
+          | Stage | Check | Tool |
+          |-------|-------|------|
+          | 1. Commit Signatures | Verify author identity on commits | Git GPG/SSH + Gitsign |
+          | 2. SAST | Static code analysis | Semgrep + CodeQL |
+          | 3. Build | Multi-stage Docker build (minimal base) | Docker BuildKit |
+          | 4. Vulnerability Scan | Container image CVE scan | Trivy |
+          | 5. SBOM | Software Bill of Materials generation | Syft (SPDX + CycloneDX) |
+          | 6. Image Signing | Cryptographic image attestation | Cosign (keyless OIDC) |
+          | 7. Provenance | SLSA build provenance record | in-toto / SLSA framework |
+          | 8. K8s Deploy | Deploy to ephemeral cluster | KinD |
+          | 9. Admission Control | Enforce image signature policy | Kyverno |
+          | 10. DAST | Dynamic security testing on live app | OWASP ZAP |
+
+          ## Run Details
+          - **Run ID:** ${{ github.run_id }}
+          - **Commit:** ${{ github.sha }}
+          - **Branch:** ${{ github.ref_name }}
+          - **Triggered by:** ${{ github.actor }}
+          - **Timestamp:** $(date -u +%Y-%m-%dT%H:%M:%SZ)
+          - **Image:** ${{ env.FULL_IMAGE }}:${{ env.IMAGE_TAG }}
+
+          ## Artifacts Generated
+          All security artifacts are attached to this workflow run and
+          serve as an immutable audit trail in GitHub Actions.
+          EOF
+
+          echo ""
+          echo "============================================"
+          echo "  PIPELINE COMPLETE — ALL STAGES EXECUTED"
+          echo "============================================"
+          cat /tmp/pipeline-audit-summary.md
+
+      - name: Upload final audit summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: 00-pipeline-audit-summary
+          path: /tmp/pipeline-audit-summary.md

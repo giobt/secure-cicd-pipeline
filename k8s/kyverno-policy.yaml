@@ -1,0 +1,42 @@
+# =============================================================================
+# Kyverno ClusterPolicy: Verify Image Signatures
+#
+# This policy enforces that all container images in the default namespace
+# are signed with Cosign. In a real environment, you would configure the
+# 'key' or 'keyless' section with your actual signing identity.
+#
+# For this demo pipeline, we use a static key pair generated during the
+# workflow run. In production, use keyless signing with your CI/CD
+# provider's OIDC identity (e.g., GitHub Actions OIDC).
+# =============================================================================
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: verify-image-signature
+spec:
+  validationFailureAction: Audit  # Set to 'Enforce' in production
+  background: false
+  rules:
+    - name: verify-cosign-signature
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - default
+      verifyImages:
+        - imageReferences:
+            - "ghcr.io/*"
+          attestors:
+            - count: 1
+              entries:
+                - keyless:
+                    issuer: "https://token.actions.githubusercontent.com"
+                    subjectRegExp: "https://github.com/.*"
+                  # For static key verification (used in demo):
+                  # keys:
+                  #   publicKeys: |-
+                  #     -----BEGIN PUBLIC KEY-----
+                  #     <your-cosign-public-key>
+                  #     -----END PUBLIC KEY-----
