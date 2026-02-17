@@ -63,26 +63,12 @@ jobs:
           echo "============================================"
           echo ""
 
-          # Check the latest commit's signature
-          COMMIT_SHA="${{ github.sha }}"
-          echo "Checking commit: $COMMIT_SHA"
-
-          # Attempt GPG/SSH signature verification
-          # In a real pipeline, unsigned commits would fail the build
-          SIGNATURE_STATUS=$(git log --format='%G?' -1 "$COMMIT_SHA" 2>/dev/null || echo "N")
-
-          case "$SIGNATURE_STATUS" in
-            G) echo "✅ Commit is signed with a GOOD signature" ;;
-            B) echo "❌ Commit has a BAD signature — FAILING"; exit 1 ;;
-            U) echo "⚠️  Commit is signed but key is UNTRUSTED (acceptable for demo)" ;;
-            X) echo "✅ Commit is signed with an EXPIRED but valid signature" ;;
-            N) echo "⚠️  Commit is NOT signed (would fail in enforced mode)" ;;
-            *)  echo "⚠️  Signature status unknown: $SIGNATURE_STATUS" ;;
-          esac
-
-          echo ""
-          echo "Commit details:"
-          git log --format='  Author:  %aN <%aE>%n  Date:    %aD%n  Message: %s%n  Sig:     %G? %GS' -1
+          if git verify-commit HEAD 2>&1; then
+              echo "✅ Commit signature is valid"
+          else
+              echo "❌ Commit signature verification failed"
+              exit 1
+          fi
 
           # Generate audit artifact
           echo "---" > /tmp/commit-signature-report.txt
