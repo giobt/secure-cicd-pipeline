@@ -41,6 +41,7 @@ permissions:
   id-token: write        # Keyless signing with Cosign (OIDC)
   security-events: write # Upload SARIF results
   attestations: write    # GitHub attestations
+  artifact-metadata: write # Upload artifacts
 
 jobs:
   # ===========================================================================
@@ -422,6 +423,24 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      # GitHub-signed attestation (new)
+      - name: Generate GitHub-signed build provenance
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-name: ${{ env.FULL_IMAGE }}
+          subject-digest: ${{ needs.build.outputs.image-digest }}
+          push-to-registry: true
+
       - name: Generate provenance record
         run: |
           echo "============================================"
